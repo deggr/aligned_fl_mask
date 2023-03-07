@@ -31,7 +31,7 @@ parser.add_argument('--eta', type=float, help='learning rate', default=0.01)
 parser.add_argument('--clients', type=int, help='number of clients per round', default=20)
 parser.add_argument('--rounds', type=int, help='number of global rounds', default=400)
 parser.add_argument('--epochs', type=int, help='number of local epochs', default=10)
-parser.add_argument('--dataset', type=str, choices=('mnist', 'emnist', 'cifar10', 'cifar100'),
+parser.add_argument('--dataset', type=str, choices=('mnist', 'fashionmnist', 'emnist', 'cifar10', 'cifar100'),
                     default='mnist', help='Dataset to use')
 parser.add_argument('--distribution', type=str, choices=('dirichlet', 'lotteryfl', 'iid'), default='dirichlet',
                     help='how should the dataset be distributed?')
@@ -66,7 +66,7 @@ parser.add_argument('--min-votes', default=0, type=int, help='Minimum votes requ
 parser.add_argument('--no-eval', default=True, action='store_false', dest='eval')
 parser.add_argument('--grasp', default=False, action='store_true')
 parser.add_argument('--fp16', default=False, action='store_true', help='upload as fp16')
-parser.add_argument('-o', '--outfile', default='output.log', type=argparse.FileType('a', encoding='ascii'))
+parser.add_argument('-o', '--outfile', default='dst_output.log', type=argparse.FileType('a', encoding='ascii'))
 
 
 args = parser.parse_args()
@@ -97,6 +97,7 @@ def nan_to_num(x, nan=0, posinf=0, neginf=0):
 
 
 def evaluate_global(clients, global_model, progress=False, n_batches=0):
+    mean_acc = 0
     with torch.no_grad():
         accuracies = {}
         sparsities = {}
@@ -109,8 +110,9 @@ def evaluate_global(clients, global_model, progress=False, n_batches=0):
         for client_id, client in enumerator:
             accuracies[client_id] = client.test(model=global_model).item()
             sparsities[client_id] = client.sparsity()
-
-    return accuracies, sparsities
+            mean_acc += accuracies[client_id]
+    mean_acc /= len(clients)
+    return accuracies, sparsities, mean_acc
 
 
 def evaluate_local(clients, global_model, progress=False, n_batches=0):
@@ -521,7 +523,7 @@ for server_round in tqdm(range(args.rounds)):
     # evaluate performance
     torch.cuda.empty_cache()
     if server_round % args.eval_every == 0 and args.eval:
-        accuracies, sparsities = evaluate_global(clients, global_model, progress=True,
+        accuracies, sparsities, mean_acc = evaluate_global(clients, global_model, progress=True,
                                                  n_batches=args.test_batches)
 
     for client_id in clients:
@@ -546,7 +548,9 @@ for server_round in tqdm(range(args.rounds)):
                            sparsity=sparsities[client_id],
                            compute_time=compute_times[i],
                            download_cost=download_cost[i],
-                           upload_cost=upload_cost[i])
+                           upload_cost=upload_cost[i],
+                           mean_acc=mean_acc
+                           )
 
         # if we didn't send initial global params to any clients in the first round, send them now.
         # (in the real world, this could be implemented as the transmission of
@@ -559,19 +563,4 @@ for server_round in tqdm(range(args.rounds)):
         compute_times[:] = 0
         download_cost[:] = 0
         upload_cost[:] = 0
-
-#print2('OVERALL SUMMARY')
-#print2()
-#print2(f'{args.total_clients} clients, {args.clients} chosen each round')
-#print2(f'E={args.epochs} local epochs per round, B={args.batch_size} mini-batch size')
-#print2(f'{args.rounds} rounds of federated learning')
-#print2(f'Target sparsity r_target={args.target_sparsity}, pruning rate (per round) r_p={args.pruning_rate}')
-#print2(f'Accuracy threshold starts at {args.pruning_threshold} and ends at {args.final_pruning_threshold}')
-#print2(f'Accuracy threshold growth method "{args.pruning_threshold_growth_method}"')
-#print2(f'Pruning method: {args.pruning_method}, resetting weights: {args.reset_weights}')
-#print2()
-#print2(f'ACCURACY: mean={np.mean(accuracies)}, std={np.std(accuracies)}, min={np.min(accuracies)}, max={np.max(accuracies)}')
-#print2(f'SPARSITY: mean={np.mean(sparsities)}, std={np.std(sparsities)}, min={np.min(sparsities)}, max={np.max(sparsities)}')
-#print2()
-#print2()
 

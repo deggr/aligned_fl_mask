@@ -1,6 +1,9 @@
 from synflow.Utils import load, generator
 from synflow.prune import *
 from grasp_models import MNISTNet, CIFAR10Net, CIFAR100Net
+
+from floco.config.config import DEVICE
+
 # net = MNISTNet()
 # initialize_mask(net)
 # mp = generator.masked_parameters(net, False, False, False)
@@ -10,7 +13,7 @@ def grasp(client, dataset='mnist', sparsity=0.8):
     mp = generator.masked_parameters(net, False, False, False)
     print(mp)
     pruner = load.pruner('grasp')(mp)
-    prune_loop(net, client.criterion, pruner, client.train_data, 'cpu', sparsity, 'exponential', 'global', 1)
+    prune_loop(net, client.criterion, pruner, client.train_data, DEVICE, sparsity, 'exponential', 'global', 1)
 
     print(net.sparsity())
 

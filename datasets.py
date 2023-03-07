@@ -103,7 +103,7 @@ def get_mnist_or_cifar10(dataset='mnist', mode='dirichlet', path=None, clients=4
     Returns: dict of client_id -> 2-tuples of DataLoaders
     '''
 
-    if dataset not in ('mnist', 'cifar10', 'cifar100'):
+    if dataset not in ('mnist', 'fashionmnist', 'cifar10', 'cifar100'):
         raise ValueError(f'unsupported dataset {dataset}')
 
     if path is None:
@@ -119,6 +119,14 @@ def get_mnist_or_cifar10(dataset='mnist', mode='dirichlet', path=None, clients=4
             ])
             train = torchvision.datasets.MNIST(path, train=True, download=True, transform=xfrm)
             test = torchvision.datasets.MNIST(path, train=False, download=True, transform=xfrm)
+
+        if dataset == 'fashionmnist':
+            xfrm = torchvision.transforms.Compose([
+                torchvision.transforms.ToTensor(),
+                torchvision.transforms.Normalize((0.5,), (0.5,))
+            ])
+            train = torchvision.datasets.FashionMNIST(path, train=True, download=True, transform=xfrm)
+            test = torchvision.datasets.FashionMNIST(path, train=False, download=True, transform=xfrm)
 
         elif dataset == 'cifar10':
             xfrm = torchvision.transforms.Compose([
@@ -142,6 +150,8 @@ def get_mnist_or_cifar10(dataset='mnist', mode='dirichlet', path=None, clients=4
 
     elif mode == 'lotteryfl':
         if dataset == 'mnist':
+            from non_iid.dataset.mnist_noniid import get_dataset_mnist_extr_noniid as g
+        elif dataset == 'fashionmnist':
             from non_iid.dataset.mnist_noniid import get_dataset_mnist_extr_noniid as g
         elif dataset == 'cifar10':
             from non_iid.dataset.cifar10_noniid import get_dataset_cifar10_extr_noniid as g
@@ -175,9 +185,11 @@ def get_mnist_or_cifar10(dataset='mnist', mode='dirichlet', path=None, clients=4
     return loaders
 
 
+def get_fashionmnist(*args, **kwargs):
+    return get_mnist_or_cifar10('fashionmnist', *args, **kwargs)
+
 def get_mnist(*args, **kwargs):
     return get_mnist_or_cifar10('mnist', *args, **kwargs)
-
 
 def get_cifar10(*args, **kwargs):
     return get_mnist_or_cifar10('cifar10', *args, **kwargs)
@@ -187,8 +199,8 @@ def get_cifar100(*args, **kwargs):
     return get_mnist_or_cifar10('cifar100', *args, **kwargs)
 
 
-def get_emnist(path='../leaf/data/femnist/data', min_samples=0, batch_size=32,
-               val_size=0.2, **kwargs):
+def get_emnist(path='../data/leaf/data/femnist/data', min_samples=0, batch_size=32,
+               val_size=0.2, clients=100, **kwargs):
     '''Read the Federated EMNIST dataset, from the LEAF benchmark.
     The number of clients, classes per client, samples per class, and
     class imbalance are all provided as part of the dataset.
@@ -205,31 +217,28 @@ def get_emnist(path='../leaf/data/femnist/data', min_samples=0, batch_size=32,
     '''
 
     EMNIST_SUBDIR = 'all_data'
-
+    client_counter = 0
     loaders = {}
     for fn in tqdm(os.listdir(os.path.join(path, EMNIST_SUBDIR))):
         fn = os.path.join(path, EMNIST_SUBDIR, fn)
         with open(fn) as f:
             subset = json.load(f)
-
-        for uid in subset['users']:
+        for uid in subset['users'][:clients]:
             user_data = subset['user_data'][uid]
             data_x = (torch.FloatTensor(x).reshape((1, 28, 28)) for x in user_data['x'])
             data = list(zip(data_x, user_data['y']))
-
             # discard clients with less than min_samples of training data
             if len(data) < min_samples:
                 continue
-
             n_train = int(len(data) * (1 - val_size))
             data_train = data[:n_train]
             data_test = data[n_train:]
             train_loader = torch.utils.data.DataLoader(data_train, batch_size=batch_size)
             test_loader = torch.utils.data.DataLoader(data_test, batch_size=batch_size)
-
             loaders[uid] = (train_loader, test_loader)
-
-
+            client_counter += 1
+            if client_counter == clients:
+                return loaders
     return loaders
 
 
@@ -249,6 +258,7 @@ def get_dataset(dataset, devices=None, **kwargs):
 
     DATASET_LOADERS = {
         'mnist': get_mnist,
+        'fashionmnist': get_fashionmnist,
         'emnist': get_emnist,
         'cifar10': get_cifar10,
         'cifar100': get_cifar100

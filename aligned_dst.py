@@ -21,11 +21,10 @@ from datasets import get_dataset
 import models
 from models import all_models, needs_mask, initialize_mask
 
-from floco.mode_connectivity import permutation_specs, weight_matching
 from floco.fl.client import flwr_set_parameters, flwr_get_parameters
-from floco.mode_connectivity.weight_matching import weight_matching, apply_permutation
 from floco.fl.nets import net_fn
 from floco.fl.util import test
+from floco.config.config import DEVICE
 
 from flwr.common import (
     NDArrays,
@@ -33,8 +32,10 @@ from flwr.common import (
     parameters_to_ndarrays,
 )
 
+import permutation_specs
+from weight_matching import weight_matching, apply_permutation
+
 ANCHOR_SELECTION_RULE = 'random'
-permutation_spec = 'feddstcnn'
 
 rng = np.random.default_rng()
 
@@ -48,7 +49,7 @@ parser.add_argument('--eta', type=float, help='learning rate', default=0.01)
 parser.add_argument('--clients', type=int, help='number of clients per round', default=20)
 parser.add_argument('--rounds', type=int, help='number of global rounds', default=400)
 parser.add_argument('--epochs', type=int, help='number of local epochs', default=10)
-parser.add_argument('--dataset', type=str, choices=('mnist', 'emnist', 'cifar10', 'cifar100'),
+parser.add_argument('--dataset', type=str, choices=('mnist', 'fashionmnist', 'emnist', 'cifar10', 'cifar100'),
                     default='mnist', help='Dataset to use')
 parser.add_argument('--distribution', type=str, choices=('dirichlet', 'lotteryfl', 'iid'), default='dirichlet',
                     help='how should the dataset be distributed?')
@@ -76,19 +77,26 @@ parser.add_argument('--l2', default=0.001, type=float, help='L2 regularization s
 parser.add_argument('--momentum', default=0.9, type=float, help='Local client SGD momentum parameter')
 parser.add_argument('--cache-test-set', default=False, action='store_true', help='Load test sets into memory')
 parser.add_argument('--cache-test-set-gpu', default=False, action='store_true', help='Load test sets into GPU memory')
-parser.add_argument('--test-batches', default=0, type=int, help='Number of minibatches to test on, or 0 for all of them')
+parser.add_argument('--test-batches', default=100, type=int, help='Number of minibatches to test on, or 0 for all of them')
 parser.add_argument('--eval-every', default=10, type=int, help='Evaluate on test set every N rounds')
 parser.add_argument('--device', default='0', type=device_list, help='Device to use for compute. Use "cpu" to force CPU. Otherwise, separate with commas to allow multi-GPU.')
 parser.add_argument('--min-votes', default=0, type=int, help='Minimum votes required to keep a weight')
 parser.add_argument('--no-eval', default=True, action='store_false', dest='eval')
 parser.add_argument('--grasp', default=False, action='store_true')
 parser.add_argument('--fp16', default=False, action='store_true', help='upload as fp16')
-parser.add_argument('-o', '--outfile', default='output.log', type=argparse.FileType('a', encoding='ascii'))
+parser.add_argument('-o', '--outfile', default='aligned_dst_output.log', type=argparse.FileType('a', encoding='ascii'))
 
 
 args = parser.parse_args()
-devices = [torch.device(x) for x in args.device]
+devices = [DEVICE]
 args.pid = os.getpid()
+
+if args.dataset == 'emnist':
+    permutation_spec = permutation_specs.cnn_permutation_spec()
+elif args.dataset == 'cifar10':
+    permutation_spec = permutation_specs.cifar10_cnn_permutation_spec()
+elif args.dataset == 'fashionmnist':
+    permutation_spec = permutation_specs.fashionmnist_cnn_permutation_spec()
 
 if args.rate_decay_end is None:
     args.rate_decay_end = args.rounds // 2
@@ -118,6 +126,7 @@ def get_best_anchor_index(self, weights_results):
     return best_anchor_index
 
 def evaluate_global(clients, global_model, progress=False, n_batches=0):
+    mean_acc = 0
     with torch.no_grad():
         accuracies = {}
         sparsities = {}
@@ -130,8 +139,9 @@ def evaluate_global(clients, global_model, progress=False, n_batches=0):
         for client_id, client in enumerator:
             accuracies[client_id] = client.test(model=global_model).item()
             sparsities[client_id] = client.sparsity()
-
-    return accuracies, sparsities
+            mean_acc += accuracies[client_id]
+    mean_acc /= len(clients)
+    return accuracies, sparsities, mean_acc
 
 
 def evaluate_local(clients, global_model, progress=False, n_batches=0):
@@ -201,7 +211,7 @@ class Client:
         self.train_data, self.test_data = train_data, test_data
 
         self.device = device
-        self.net = net(device=self.device).to(self.device)
+        self.net = net(device=DEVICE).to(DEVICE)
         initialize_mask(self.net)
         self.criterion = nn.CrossEntropyLoss()
 
@@ -263,8 +273,8 @@ class Client:
             self.net.train()
             running_loss = 0.
             for inputs, labels in self.train_data:
-                inputs = inputs.to(self.device)
-                labels = labels.to(self.device)
+                inputs = inputs.to(DEVICE)
+                labels = labels.to(DEVICE)
                 self.optimizer.zero_grad()
 
                 outputs = self.net(inputs)
@@ -314,7 +324,7 @@ class Client:
             model = self.net
             _model = self.net
         else:
-            _model = model.to(self.device)
+            _model = model.to(DEVICE)
 
         _model.eval()
         with torch.no_grad():
@@ -322,8 +332,8 @@ class Client:
                 if i > n_batches and n_batches > 0:
                     break
                 if not args.cache_test_set_gpu:
-                    inputs = inputs.to(self.device)
-                    labels = labels.to(self.device)
+                    inputs = inputs.to(DEVICE)
+                    labels = labels.to(DEVICE)
                 outputs = _model(inputs)
                 outputs = torch.argmax(outputs, dim=-1)
                 correct += sum(labels == outputs)
@@ -340,8 +350,8 @@ def align_models(anchor_index, weights_results, masks_results, permutation_spec)
     anchor_weights = weights_results[anchor_index]
     anchor_mask = masks_results[anchor_index]
 
-    anchor_model = all_models[args.dataset](device='cpu')
-    masked_anchor_model = all_models[args.dataset](device='cpu')
+    anchor_model = all_models[args.dataset](device=DEVICE)
+    masked_anchor_model = all_models[args.dataset](device=DEVICE)
 
     flwr_set_parameters(anchor_model,  anchor_weights)
     flwr_set_parameters(masked_anchor_model,  anchor_mask)
@@ -356,7 +366,7 @@ def align_models(anchor_index, weights_results, masks_results, permutation_spec)
     target_weights = [weights_results[idx] for idx in target_model_ids]
     for i, tmp_target_weights in enumerate(target_weights):
         # Set model weights
-        tmp_target_model = all_models[args.dataset](device='cpu')
+        tmp_target_model = all_models[args.dataset](device=DEVICE)
         flwr_set_parameters(
             tmp_target_model,
             tmp_target_weights
@@ -374,10 +384,9 @@ def align_models(anchor_index, weights_results, masks_results, permutation_spec)
             tmp_target_permutation, 
             tmp_target_model_state_dict
             )
-        print(f"Aligned weights")
         
         # Permute mask
-        tmp_target_model_mask = all_models[args.dataset](device='cpu')
+        tmp_target_model_mask = all_models[args.dataset](device=DEVICE)
         flwr_set_parameters(
             tmp_target_model_mask,
             masks_results[target_model_ids[i]]
@@ -388,7 +397,6 @@ def align_models(anchor_index, weights_results, masks_results, permutation_spec)
             tmp_target_permutation, 
             tmp_target_model_mask_state_dict
             )
-        print(f"Aligned masks")
 
         aligned_weights.append(
             tmp_target_permuted_state_dict
@@ -414,16 +422,13 @@ for i, (client_id, client_loaders) in tqdm(enumerate(loaders.items())):
     torch.cuda.empty_cache()
 
 # initialize global model
-global_model = all_models[args.dataset](device='cpu')
+global_model = all_models[args.dataset](device=DEVICE)
 initialize_mask(global_model)
 
-if args.dataset == 'cifar10':
-    permutation_spec = permutation_specs.cifar10_cnn_permutation_spec()
-else:
-    raise NotImplementedError('Perm. specs for this model not implemented')
 
 # execute grasp on one client if needed
 if args.grasp:
+    print('GRASP IS SET TO TRUE')
     client = clients[client_ids[0]]
     from grasp import grasp
     pruned_net = grasp(client, sparsity=args.sparsity, dataset=args.dataset)
@@ -432,9 +437,9 @@ if args.grasp:
     for cname, ch in pruned_net.named_children():
         for bname, buf in ch.named_buffers():
             if bname == 'weight_mask':
-                pruned_masks[cname] = buf.to(device=torch.device('cpu'), dtype=torch.bool)
+                pruned_masks[cname] = buf.to(device=DEVICE, dtype=torch.bool)
         for pname, param in ch.named_parameters():
-            pruned_params[(cname, pname)] = param.to(device=torch.device('cpu'))
+            pruned_params[(cname, pname)] = param.to(device=DEVICE)
     for cname, ch in global_model.named_children():
         for bname, buf in ch.named_buffers():
             if bname == 'weight_mask':
@@ -466,10 +471,10 @@ for server_round in tqdm(range(args.rounds)):
     for name, param in global_params.items():
         if name.endswith('_mask'):
             continue
-        aggregated_params[name] = torch.zeros_like(param, dtype=torch.float, device='cpu')
-        aggregated_params_for_mask[name] = torch.zeros_like(param, dtype=torch.float, device='cpu')
+        aggregated_params[name] = torch.zeros_like(param, dtype=torch.float, device=DEVICE)
+        aggregated_params_for_mask[name] = torch.zeros_like(param, dtype=torch.float, device=DEVICE)
         if needs_mask(name):
-            aggregated_masks[name] = torch.zeros_like(param, device='cpu')
+            aggregated_masks[name] = torch.zeros_like(param, device=DEVICE)
 
     # for each client k \in S_t in parallel do
     total_sampled = 0
@@ -521,22 +526,25 @@ for server_round in tqdm(range(args.rounds)):
                 name = name[:-5]
             elif name.endswith('_mask'):
                 name = name[:-5]
-                cl_mask_params[name] = cl_param.to(device='cpu', copy=True)
+                cl_mask_params[name] = cl_param.to(device=DEVICE, copy=True)
                 continue
 
-            cl_weight_params[name] = cl_param.to(device='cpu', copy=True)
+            cl_weight_params[name] = cl_param.to(device=DEVICE, copy=True)
             if args.fp16:
                 cl_weight_params[name] = cl_weight_params[name].to(torch.bfloat16).to(torch.float)
 
         client_weights.append(flwr_get_parameters(client.net))
-        tmp_mask_model = all_models[args.dataset](device='cpu')
+        tmp_mask_model = all_models[args.dataset](device=DEVICE)
         copied_cl_mask_params = copy.deepcopy(cl_mask_params)
         # HACKY #
         copied_cl_mask_params["conv1.bias"] = torch.zeros_like(client.net.state_dict()["conv1.bias"])
         copied_cl_mask_params["conv2.bias"] = torch.zeros_like(client.net.state_dict()["conv2.bias"])
         copied_cl_mask_params["fc1.bias"] = torch.zeros_like(client.net.state_dict()["fc1.bias"])
         copied_cl_mask_params["fc2.bias"] = torch.zeros_like(client.net.state_dict()["fc2.bias"])
-        copied_cl_mask_params["fc3.bias"] = torch.zeros_like(client.net.state_dict()["fc3.bias"])
+        if args.dataset in ['emnist', 'fashionmnist']:
+            copied_cl_mask_params["conv3.bias"] = torch.zeros_like(client.net.state_dict()["conv3.bias"])
+        if args.dataset == 'cifar10':
+            copied_cl_mask_params["fc3.bias"] = torch.zeros_like(client.net.state_dict()["fc3.bias"])
         tmp_mask_model.load_state_dict(copied_cl_mask_params)
         client_masks.append(flwr_get_parameters(tmp_mask_model))
 
@@ -565,23 +573,22 @@ for server_round in tqdm(range(args.rounds)):
         for name, cl_param in cl_weight_params.items():
             if name in cl_mask_params:
                 # things like weights have masks
-                cl_mask = aligned_masks[j][name].long()
-                print(f"Tmp mask: {cl_mask}")
-                sv_mask = global_params[name + '_mask'].to('cpu', copy=True)
+                cl_mask = aligned_masks[j][name].long().to(DEVICE, copy=True)
+                sv_mask = global_params[name + '_mask'].to(DEVICE, copy=True)
                 # calculate Hamming distance of masks for debugging
                 if readjust:
                     dprint(f'{client.id} {name} d_h=', torch.sum(cl_mask ^ sv_mask).item())
-                aggregated_params[name].add_(client.train_size() * cl_param * cl_mask.long())
-                aggregated_params_for_mask[name].add_(client.train_size() * cl_param * cl_mask)
-                aggregated_masks[name].add_(client.train_size() * cl_mask)
+                aggregated_params[name].add_(client.train_size() * cl_param.to(DEVICE, copy=True) * cl_mask)
+                aggregated_params_for_mask[name].add_(client.train_size() * cl_param.to(DEVICE, copy=True) * cl_mask)
+                aggregated_masks[name].add_(client.train_size() * cl_mask.to(DEVICE, copy=True))
                 if args.remember_old:
                     sv_mask[cl_mask] = 0
-                    sv_param = global_params[name].to('cpu', copy=True)
+                    sv_param = global_params[name].to(DEVICE, copy=True)
                     aggregated_params_for_mask[name].add_(client.train_size() * sv_param * sv_mask)
-                    aggregated_masks[name].add_(client.train_size() * sv_mask)
+                    aggregated_masks[name].add_(client.train_size() * sv_mask.to(DEVICE, copy=True))
             else:
                 # things like biases don't have masks
-                aggregated_params[name].add_(client.train_size() * cl_param)
+                aggregated_params[name].add_(client.train_size() * cl_param.to(DEVICE, copy=True))
 
     # at this point, we have the sum of client parameters
     # in aggregated_params, and the sum of masks in aggregated_masks. We
@@ -637,7 +644,7 @@ for server_round in tqdm(range(args.rounds)):
     # evaluate performance
     torch.cuda.empty_cache()
     if server_round % args.eval_every == 0 and args.eval:
-        accuracies, sparsities = evaluate_global(clients, global_model, progress=True,
+        accuracies, sparsities, mean_acc = evaluate_global(clients, global_model, progress=True,
                                                  n_batches=args.test_batches)
 
     for client_id in clients:
@@ -662,7 +669,9 @@ for server_round in tqdm(range(args.rounds)):
                            sparsity=sparsities[client_id],
                            compute_time=compute_times[i],
                            download_cost=download_cost[i],
-                           upload_cost=upload_cost[i])
+                           upload_cost=upload_cost[i],
+                           mean_acc=mean_acc
+                           )
 
         # if we didn't send initial global params to any clients in the first round, send them now.
         # (in the real world, this could be implemented as the transmission of
@@ -675,18 +684,3 @@ for server_round in tqdm(range(args.rounds)):
         compute_times[:] = 0
         download_cost[:] = 0
         upload_cost[:] = 0
-
-print2('OVERALL SUMMARY')
-print2()
-print2(f'{args.total_clients} clients, {args.clients} chosen each round')
-print2(f'E={args.epochs} local epochs per round, B={args.batch_size} mini-batch size')
-print2(f'{args.rounds} rounds of federated learning')
-print2(f'Target sparsity r_target={args.target_sparsity}, pruning rate (per round) r_p={args.pruning_rate}')
-print2(f'Accuracy threshold starts at {args.pruning_threshold} and ends at {args.final_pruning_threshold}')
-print2(f'Accuracy threshold growth method "{args.pruning_threshold_growth_method}"')
-print2(f'Pruning method: {args.pruning_method}, resetting weights: {args.reset_weights}')
-print2()
-print2(f'ACCURACY: mean={np.mean(accuracies)}, std={np.std(accuracies)}, min={np.min(accuracies)}, max={np.max(accuracies)}')
-print2(f'SPARSITY: mean={np.mean(sparsities)}, std={np.std(sparsities)}, min={np.min(sparsities)}, max={np.max(sparsities)}')
-print2()
-print2()

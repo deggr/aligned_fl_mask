@@ -9,6 +9,8 @@ from mpl.nn import DenseConv2d, DenseLinear
 from mpl.optim import SGD
 from datasets import get_dataset
 
+from floco.config.config import DEVICE
+
 class MNISTNet(BaseModel):
 
     def __init__(self):
@@ -103,7 +105,7 @@ class CIFAR10Net(BaseModel):
 
 net = MNISTNet()
 net.calc_num_prunable_params(display=True)
-loaders = get_dataset('mnist', clients=400, batch_size=32, devices=[torch.device('cpu')], min_samples=0)
+loaders = get_dataset('mnist', clients=400, batch_size=32, devices=[DEVICE], min_samples=0)
 
 loader = loaders[0][1]
 
