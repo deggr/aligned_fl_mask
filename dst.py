@@ -66,7 +66,7 @@ parser.add_argument('--min-votes', default=0, type=int, help='Minimum votes requ
 parser.add_argument('--no-eval', default=True, action='store_false', dest='eval')
 parser.add_argument('--grasp', default=False, action='store_true')
 parser.add_argument('--fp16', default=False, action='store_true', help='upload as fp16')
-parser.add_argument('-o', '--outfile', default='dst_output.log', type=argparse.FileType('a', encoding='ascii'))
+parser.add_argument('-o', '--outfile', default='output_dst.log', type=argparse.FileType('a', encoding='ascii'))
 
 
 args = parser.parse_args()
