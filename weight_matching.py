@@ -1,12 +1,14 @@
-from collections import defaultdict
-from re import L
-from typing import NamedTuple
+import copy
 
 import torch
 from scipy.optimize import linear_sum_assignment
 
-from floco.config.config import DEVICE
+from config import DEVICE
 from floco.mode_connectivity.permutation_specs import *
+
+from floco.fl.client import flwr_set_parameters
+
+from permutation_specs import PermutationSpec, mlp_permutation_spec
 
 import numpy as np
 
@@ -65,22 +67,72 @@ def weight_matching(ps: PermutationSpec, params_a, params_b, max_iter=100, init_
 
   return perm
 
-def test_weight_matching():
-  """If we just have a single hidden layer then it should converge after just one step."""
-  ps = mlp_permutation_spec(num_hidden_layers=3)
-  rng = torch.Generator()
-  rng.manual_seed(13)
-  num_hidden = 10
-  shapes = {
-      "layer0.weight": (2, num_hidden),
-      "layer0.bias": (num_hidden, ),
-      "layer1.weight": (num_hidden, 3),
-      "layer1.bias": (3, )
-  }
+def align_models(all_models, dataset, clients, anchor_index, weights_results, masks_results, permutation_spec):
 
-  params_a = {k: torch.randn(shape, generator=rng) for k, shape in shapes.items()}
-  params_b = {k: torch.randn(shape, generator=rng) for k, shape in shapes.items()}
-  perm = weight_matching(rng, ps, params_a, params_b)
+    anchor_weights = weights_results[anchor_index]
+    anchor_mask = masks_results[anchor_index]
+
+    anchor_model = all_models[dataset](device=DEVICE)
+    masked_anchor_model = all_models[dataset](device=DEVICE)
+
+    anchor_model.load_state_dict(anchor_weights)
+    masked_anchor_model.load_state_dict(anchor_mask)
+
+    # flwr_set_parameters(anchor_model, anchor_weights)
+    # flwr_set_parameters(masked_anchor_model,  anchor_mask)
+    
+    anchor_state_dict = copy.deepcopy(anchor_model.state_dict())
+    anchor_mask_state_dict = copy.deepcopy(masked_anchor_model.state_dict())
+    
+    aligned_weights = [anchor_state_dict]
+    aligned_masks = [anchor_mask_state_dict]
+
+    target_model_ids = np.delete(np.arange(clients), anchor_index)
+    target_weights = [weights_results[idx] for idx in target_model_ids]
+    for i, tmp_target_weights in enumerate(target_weights):
+        # Set model weights
+        tmp_target_model = all_models[dataset](device=DEVICE)
+        # flwr_set_parameters(
+        #     tmp_target_model,
+        #     tmp_target_weights
+        #     )
+        tmp_target_model.load_state_dict(tmp_target_weights)
+        tmp_target_model_state_dict = copy.deepcopy(tmp_target_model.state_dict())
+        
+        # Permuted weights
+        tmp_target_permutation = weight_matching(
+            permutation_spec,
+            anchor_state_dict, 
+            tmp_target_model_state_dict
+            )
+        tmp_target_permuted_state_dict = apply_permutation(
+            permutation_spec, 
+            tmp_target_permutation, 
+            tmp_target_model_state_dict
+            )
+        
+        # Permute mask
+        tmp_target_model_mask = all_models[dataset](device=DEVICE)
+        # flwr_set_parameters(
+        #     tmp_target_model_mask,
+        #     masks_results[target_model_ids[i]]
+        #     )
+        tmp_target_model.load_state_dict(masks_results[target_model_ids[i]])
+        tmp_target_model_mask_state_dict = copy.deepcopy(tmp_target_model.state_dict())
+        tmp_target_permuted_mask_state_dict = apply_permutation(
+            permutation_spec, 
+            tmp_target_permutation, 
+            tmp_target_model_mask_state_dict
+            )
+
+        aligned_weights.append(
+            tmp_target_permuted_state_dict
+        )
+        aligned_masks.append(
+            tmp_target_permuted_mask_state_dict
+        )
+
+    return aligned_weights, aligned_masks
 
 # if __name__ == "__main__":
 #   test_weight_matching()
